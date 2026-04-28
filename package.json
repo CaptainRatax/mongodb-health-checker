@@ -1,0 +1,23 @@
+{
+  "name": "mongodb-health-checker",
+  "version": "1.0.0",
+  "description": "Checks MongoDB databases and pushes status updates to Uptime Kuma.",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "check": "node --check src/index.js"
+  },
+  "keywords": [
+    "mongodb",
+    "uptime-kuma",
+    "health-check"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.17"
+  },
+  "dependencies": {
+    "dotenv": "^16.0.0",
+    "mongodb": "^6.0.0"
+  }
+}
