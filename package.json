@@ -1,7 +1,7 @@
 {
   "name": "mongodb-health-checker",
   "version": "1.0.0",
-  "description": "Checks MongoDB databases and pushes status updates to Uptime Kuma.",
+  "description": "Authenticated HTTP health API for MongoDB databases and Uptime Kuma.",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
@@ -18,6 +18,7 @@
   },
   "dependencies": {
     "dotenv": "^16.0.0",
+    "express": "^5.2.1",
     "mongodb": "^6.0.0"
   }
 }

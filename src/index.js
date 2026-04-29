@@ -1,13 +1,16 @@
 require("dotenv").config();
 
+const crypto = require("node:crypto");
 const { performance } = require("node:perf_hooks");
+const express = require("express");
 const { MongoClient } = require("mongodb");
 
-const DEFAULT_INTERVAL_MS = 60_000;
-const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
+const DEFAULT_API_HOST = "127.0.0.1";
+const DEFAULT_API_PORT = 3072;
 const DEFAULT_MONGODB_SERVER_SELECTION_TIMEOUT_MS = 5_000;
 const DEFAULT_MONGODB_CONNECT_TIMEOUT_MS = 5_000;
 const DEFAULT_MONGODB_SOCKET_TIMEOUT_MS = 10_000;
+const MIN_API_AUTH_TOKEN_LENGTH = 32;
 
 const RAW_CHECKS = [
   {
@@ -45,11 +48,9 @@ const RAW_CHECKS = [
 const clients = new Map();
 
 const config = {
-  intervalMs: readPositiveInteger("CHECK_INTERVAL_MS", DEFAULT_INTERVAL_MS),
-  requestTimeoutMs: readPositiveInteger(
-    "REQUEST_TIMEOUT_MS",
-    DEFAULT_REQUEST_TIMEOUT_MS,
-  ),
+  apiHost: process.env.API_HOST || DEFAULT_API_HOST,
+  apiPort: readPort("API_PORT", DEFAULT_API_PORT),
+  apiAuthToken: (process.env.API_AUTH_TOKEN || "").trim(),
   mongodbServerSelectionTimeoutMs: readPositiveInteger(
     "MONGODB_SERVER_SELECTION_TIMEOUT_MS",
     DEFAULT_MONGODB_SERVER_SELECTION_TIMEOUT_MS,
@@ -65,8 +66,8 @@ const config = {
 };
 
 const checks = loadChecks();
-let isCycleRunning = false;
-let intervalHandle;
+let server;
+let isShuttingDown = false;
 
 main().catch((error) => {
   console.error("Fatal error:", error);
@@ -74,21 +75,113 @@ main().catch((error) => {
 });
 
 async function main() {
-  if (checks.length === 0) {
-    console.error("No checks configured. Please fill in the .env file first.");
+  const startupErrors = validateStartupConfig();
+
+  if (startupErrors.length > 0) {
+    console.error(`Invalid configuration:\n${startupErrors.join("\n")}`);
     process.exitCode = 1;
     return;
   }
 
-  console.log(
-    `MongoDB health checker started with ${checks.length} checks every ${config.intervalMs}ms.`,
-  );
+  const app = createApp();
 
-  await runCycle();
-  intervalHandle = setInterval(runCycle, config.intervalMs);
+  server = app.listen(config.apiPort, config.apiHost, () => {
+    console.log(
+      `MongoDB health API listening on http://${config.apiHost}:${config.apiPort}`,
+    );
+    console.log(`Loaded ${checks.length} database checks.`);
+  });
 
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
+}
+
+function createApp() {
+  const app = express();
+
+  app.disable("x-powered-by");
+  app.use(setBaseHeaders);
+  app.use(allowOnlyGetAndHead);
+  app.use(authenticate);
+
+  app.get("/", (_request, response) => {
+    response.json(buildApiIndex());
+  });
+
+  app.get("/health", (_request, response) => {
+    response.json(buildApiIndex());
+  });
+
+  app.get("/health/all", async (_request, response, next) => {
+    try {
+      const results = await Promise.all(checks.map(checkMongoDatabase));
+      const isUp = results.every((result) => result.status === "up");
+
+      response.status(isUp ? 200 : 503).json({
+        status: isUp ? "up" : "down",
+        checkedAt: new Date().toISOString(),
+        checks: results,
+      });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/health/:key", async (request, response, next) => {
+    try {
+      const check = checks.find((candidate) => candidate.key === request.params.key);
+
+      if (!check) {
+        response.status(404).json({
+          status: "error",
+          message: `Unknown database check: ${request.params.key}`,
+        });
+        return;
+      }
+
+      const result = await checkMongoDatabase(check);
+
+      response.status(result.status === "up" ? 200 : 503).json(result);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.use((_request, response) => {
+    response.status(404).json({
+      status: "error",
+      message: "Not found",
+    });
+  });
+
+  app.use((error, _request, response, _next) => {
+    console.error("Unexpected API request failure:", error);
+
+    response.status(500).json({
+      status: "error",
+      message: "Internal server error",
+    });
+  });
+
+  return app;
+}
+
+function validateStartupConfig() {
+  const errors = [];
+
+  if (checks.length === 0) {
+    errors.push("- No database checks configured");
+  }
+
+  if (!config.apiAuthToken) {
+    errors.push("- Missing API_AUTH_TOKEN");
+  } else if (config.apiAuthToken.length < MIN_API_AUTH_TOKEN_LENGTH) {
+    errors.push(
+      `- API_AUTH_TOKEN must have at least ${MIN_API_AUTH_TOKEN_LENGTH} characters`,
+    );
+  }
+
+  return errors;
 }
 
 function loadChecks() {
@@ -98,19 +191,10 @@ function loadChecks() {
   for (const check of RAW_CHECKS) {
     const mongoUriEnv = `${check.prefix}_MONGODB_URI`;
     const databaseEnv = `${check.prefix}_MONGODB_DATABASE`;
-    const pushUrlEnv = `${check.prefix}_UPTIME_KUMA_PUSH_URL`;
     const mongoUri = process.env[mongoUriEnv];
-    const pushUrl = process.env[pushUrlEnv];
 
     if (!mongoUri) {
       configErrors.push(`- Missing ${mongoUriEnv}`);
-    }
-
-    if (!pushUrl) {
-      configErrors.push(`- Missing ${pushUrlEnv}`);
-    }
-
-    if (!mongoUri || !pushUrl) {
       continue;
     }
 
@@ -128,63 +212,21 @@ function loadChecks() {
       ...check,
       mongoUri,
       databaseName,
-      pushUrl,
+      endpoint: `/health/${check.key}`,
     });
   }
 
   if (configErrors.length > 0) {
-    console.error(`Invalid configuration:\n${configErrors.join("\n")}`);
-    process.exitCode = 1;
+    console.error(`Invalid database configuration:\n${configErrors.join("\n")}`);
     return [];
   }
 
   return loadedChecks;
 }
 
-async function runCycle() {
-  if (isCycleRunning) {
-    console.warn("Previous health check cycle is still running. Skipping tick.");
-    return;
-  }
-
-  isCycleRunning = true;
-  const startedAt = new Date();
-  console.log(`[${startedAt.toISOString()}] Running health checks...`);
-
-  try {
-    const results = await Promise.allSettled(checks.map(runCheck));
-
-    for (const result of results) {
-      if (result.status === "rejected") {
-        console.error("Unexpected check failure:", result.reason);
-      }
-    }
-  } finally {
-    isCycleRunning = false;
-  }
-}
-
-async function runCheck(check) {
-  const result = await checkMongoDatabase(check);
-
-  try {
-    await pushToUptimeKuma(check, result);
-    console.log(
-      `[${check.key}] ${result.status.toUpperCase()} - ${result.message}${
-        result.pingMs === null ? "" : ` (${result.pingMs}ms)`
-      }`,
-    );
-  } catch (error) {
-    console.error(
-      `[${check.key}] Failed to push status to Uptime Kuma: ${formatErrorMessage(
-        error,
-      )}`,
-    );
-  }
-}
-
 async function checkMongoDatabase(check) {
   const startedAt = performance.now();
+  const checkedAt = new Date().toISOString();
 
   try {
     const client = getMongoClient(check);
@@ -192,17 +234,25 @@ async function checkMongoDatabase(check) {
     await client.db(check.databaseName).command({ ping: 1 });
 
     return {
+      key: check.key,
+      name: check.name,
+      database: check.databaseName,
       status: "up",
       message: "OK",
       pingMs: Math.round(performance.now() - startedAt),
+      checkedAt,
     };
   } catch (error) {
     await resetMongoClient(check.key);
 
     return {
+      key: check.key,
+      name: check.name,
+      database: check.databaseName,
       status: "down",
       message: `MongoDB check failed: ${formatErrorMessage(error)}`,
       pingMs: null,
+      checkedAt,
     };
   }
 }
@@ -242,43 +292,84 @@ async function resetMongoClient(key) {
   }
 }
 
-async function pushToUptimeKuma(check, result) {
-  const url = buildUptimeKumaUrl(check.pushUrl, result);
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), config.requestTimeoutMs);
-
-  try {
-    const response = await fetch(url, {
-      method: "GET",
-      signal: controller.signal,
-    });
-
-    if (!response.ok) {
-      const body = await response.text().catch(() => "");
-      throw new Error(
-        `HTTP ${response.status} ${response.statusText}${
-          body ? ` - ${body.slice(0, 200)}` : ""
-        }`,
-      );
-    }
-  } finally {
-    clearTimeout(timeout);
-  }
+function buildApiIndex() {
+  return {
+    service: "mongodb-health-checker",
+    status: "up",
+    authentication: {
+      type: "bearer",
+      header: "Authorization: Bearer <API_AUTH_TOKEN>",
+    },
+    endpoints: {
+      api: "/health",
+      allDatabases: "/health/all",
+      databases: checks.map((check) => ({
+        key: check.key,
+        name: check.name,
+        endpoint: check.endpoint,
+      })),
+    },
+  };
 }
 
-function buildUptimeKumaUrl(pushUrl, result) {
-  const url = new URL(pushUrl);
+function isAuthorized(request) {
+  const authorization = request.headers.authorization;
 
-  url.searchParams.set("status", result.status);
-  url.searchParams.set("msg", result.message);
-
-  if (Number.isFinite(result.pingMs)) {
-    url.searchParams.set("ping", String(result.pingMs));
-  } else {
-    url.searchParams.set("ping", "");
+  if (!authorization) {
+    return false;
   }
 
-  return url.toString();
+  const [scheme, ...tokenParts] = authorization.trim().split(/\s+/);
+
+  if (!scheme || scheme.toLowerCase() !== "bearer") {
+    return false;
+  }
+
+  return secureCompare(tokenParts.join(" "), config.apiAuthToken);
+}
+
+function secureCompare(value, expectedValue) {
+  const valueHash = crypto.createHash("sha256").update(value).digest();
+  const expectedHash = crypto
+    .createHash("sha256")
+    .update(expectedValue)
+    .digest();
+
+  return crypto.timingSafeEqual(valueHash, expectedHash);
+}
+
+function setBaseHeaders(_request, response, next) {
+  response.setHeader("Content-Type", "application/json; charset=utf-8");
+  response.setHeader("Cache-Control", "no-store");
+  response.setHeader("X-Content-Type-Options", "nosniff");
+
+  next();
+}
+
+function allowOnlyGetAndHead(request, response, next) {
+  if (request.method === "GET" || request.method === "HEAD") {
+    next();
+    return;
+  }
+
+  response.setHeader("Allow", "GET, HEAD");
+  response.status(405).json({
+    status: "error",
+    message: "Method not allowed",
+  });
+}
+
+function authenticate(request, response, next) {
+  if (isAuthorized(request)) {
+    next();
+    return;
+  }
+
+  response.setHeader("WWW-Authenticate", 'Bearer realm="mongodb-health"');
+  response.status(401).json({
+    status: "error",
+    message: "Unauthorized",
+  });
 }
 
 function getDatabaseNameFromMongoUri(mongoUri) {
@@ -311,28 +402,51 @@ function readPositiveInteger(envName, fallback) {
   return value;
 }
 
+function readPort(envName, fallback) {
+  const port = readPositiveInteger(envName, fallback);
+
+  if (port > 65_535) {
+    console.warn(`${envName} must be a valid TCP port. Falling back to ${fallback}.`);
+    return fallback;
+  }
+
+  return port;
+}
+
 function formatErrorMessage(error) {
   if (!error) {
     return "Unknown error";
-  }
-
-  if (error.name === "AbortError") {
-    return "Request timed out";
   }
 
   return error.message || String(error);
 }
 
 async function shutdown() {
-  console.log("Shutting down MongoDB health checker...");
-
-  if (intervalHandle) {
-    clearInterval(intervalHandle);
+  if (isShuttingDown) {
+    return;
   }
 
-  await Promise.allSettled(
-    Array.from(clients.keys()).map((key) => resetMongoClient(key)),
-  );
+  isShuttingDown = true;
+  console.log("Shutting down MongoDB health API...");
+
+  await Promise.allSettled([closeHttpServer(), closeMongoClients()]);
 
   process.exit(0);
+}
+
+function closeHttpServer() {
+  return new Promise((resolve) => {
+    if (!server || !server.listening) {
+      resolve();
+      return;
+    }
+
+    server.close(resolve);
+  });
+}
+
+function closeMongoClients() {
+  return Promise.allSettled(
+    Array.from(clients.keys()).map((key) => resetMongoClient(key)),
+  );
 }
